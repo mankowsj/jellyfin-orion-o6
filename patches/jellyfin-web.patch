@@ -1,0 +1,155 @@
+diff --git a/src/apps/dashboard/features/playback/constants/codecs.ts b/src/apps/dashboard/features/playback/constants/codecs.ts
+index 98b3e5f..c319af5 100644
+--- a/src/apps/dashboard/features/playback/constants/codecs.ts
++++ b/src/apps/dashboard/features/playback/constants/codecs.ts
+@@ -22,13 +22,14 @@ export const CODECS = [
+             'qsv',
+             'vaapi',
+             'rkmpp',
+-            'videotoolbox'
++            'videotoolbox',
++            'v4l2m2m'
+         ]
+     },
+     {
+         name: 'MPEG1',
+         codec: 'mpeg1video',
+-        types: [ 'rkmpp' ]
++        types: [ 'rkmpp', 'v4l2m2m' ]
+     },
+     {
+         name: 'MPEG2',
+@@ -38,7 +39,8 @@ export const CODECS = [
+             'nvenc',
+             'qsv',
+             'vaapi',
+-            'rkmpp'
++            'rkmpp',
++            'v4l2m2m'
+         ]
+     },
+     {
+@@ -46,7 +48,8 @@ export const CODECS = [
+         codec: 'mpeg4',
+         types: [
+             'nvenc',
+-            'rkmpp'
++            'rkmpp',
++            'v4l2m2m'
+         ]
+     },
+     {
+@@ -56,7 +59,8 @@ export const CODECS = [
+             'amf',
+             'nvenc',
+             'qsv',
+-            'vaapi'
++            'vaapi',
++            'v4l2m2m'
+         ]
+     },
+     {
+@@ -67,7 +71,8 @@ export const CODECS = [
+             'qsv',
+             'vaapi',
+             'rkmpp',
+-            'videotoolbox'
++            'videotoolbox',
++            'v4l2m2m'
+         ]
+     },
+     {
+@@ -79,7 +84,8 @@ export const CODECS = [
+             'qsv',
+             'vaapi',
+             'rkmpp',
+-            'videotoolbox'
++            'videotoolbox',
++            'v4l2m2m'
+         ]
+     },
+     {
+@@ -91,7 +97,8 @@ export const CODECS = [
+             'qsv',
+             'vaapi',
+             'rkmpp',
+-            'videotoolbox'
++            'videotoolbox',
++            'v4l2m2m'
+         ]
+     }
+ ];
+@@ -102,7 +109,8 @@ export const HEVC_VP9_HW_DECODING_TYPES = [
+     'nvenc',
+     'qsv',
+     'vaapi',
+-    'rkmpp'
++    'rkmpp',
++    'v4l2m2m'
+ ];
+ 
+ /** Hardware decoders which support HEVC RExt */
+diff --git a/src/apps/dashboard/routes/playback/transcoding.tsx b/src/apps/dashboard/routes/playback/transcoding.tsx
+index 482b34b..1098d48 100644
+--- a/src/apps/dashboard/routes/playback/transcoding.tsx
++++ b/src/apps/dashboard/routes/playback/transcoding.tsx
+@@ -372,6 +372,23 @@ export const Component = () => {
+                                                 </FormHelperText>
+                                             </>
+                                         )}
++                                        {hardwareAccelType === 'v4l2m2m' && (
++                                            <>
++                                                <FormControlLabel
++                                                    label={'Enable HEVC hardware encoding (VPU / V4L2M2M)'}
++                                                    control={
++                                                        <Checkbox
++                                                            name='EnableV4l2m2mHevcEncoder'
++                                                            checked={Boolean((config as unknown as Record<string, unknown>).EnableV4l2m2mHevcEncoder)}
++                                                            onChange={onCheckboxChange}
++                                                        />
++                                                    }
++                                                />
++                                                <FormHelperText>
++                                                    {'Encode HEVC on the VPU (hevc_v4l2m2m) instead of software x265. Requires “Allow encoding in HEVC format” and an HEVC-capable client. Falls back to software if the encoder is unavailable.'}
++                                                </FormHelperText>
++                                            </>
++                                        )}
+                                     </FormGroup>
+                                 </FormControl>
+                             )}
+diff --git a/src/components/playerstats/playerstats.js b/src/components/playerstats/playerstats.js
+index 804c97e..381ea70 100644
+--- a/src/components/playerstats/playerstats.js
++++ b/src/components/playerstats/playerstats.js
+@@ -176,17 +176,20 @@ function getTranscodingStats(session, player, displayPlayMethod) {
+                 value: session.TranscodingInfo.TranscodeReasons.map(translateReason).join('<br/>')
+             });
+         }
+-        // Hide this for now because it is not useful in its current state.
+-        // This only reflects the configuration in the dashboard, but the actual
+-        // decoder/encoder selection is more complex. As a result, the hardware
+-        // encoder may not be used even if hardware acceleration is configured,
+-        // making the display of hardware acceleration misleading.
+-        // if (session.TranscodingInfo.HardwareAccelerationType) {
+-        //     sessionStats.push({
+-        //         label: globalize.translate('LabelHardwareEncoding'),
+-        //         value: session.TranscodingInfo.HardwareAccelerationType
+-        //     });
+-        // }
++        // These reflect the ACTUAL decoder/encoder selection (computed server-side from the
++        // real ffmpeg pipeline), not just the configured acceleration type.
++        if (session.TranscodingInfo.IsHardwareDecoding != null) {
++            sessionStats.push({
++                label: 'Hardware decoding',
++                value: session.TranscodingInfo.IsHardwareDecoding ? 'Yes' : 'No'
++            });
++        }
++        if (session.TranscodingInfo.IsHardwareEncoding != null) {
++            sessionStats.push({
++                label: 'Hardware encoding',
++                value: session.TranscodingInfo.IsHardwareEncoding ? 'Yes' : 'No'
++            });
++        }
+     }
+ 
+     return sessionStats;

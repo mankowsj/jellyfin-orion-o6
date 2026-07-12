@@ -1,0 +1,128 @@
+# syntax=docker/dockerfile:1
+
+###############################################################################
+# Jellyfin + FFmpeg with CIX Sky1 (CD8180) VPU patches, CPU-tuned for Armv9.2-A
+#
+#   - x264, x265 (8/10/12-bit), libaom built from source with
+#     -march=armv9.2-a -mtune=cortex-a720 and statically linked into FFmpeg.
+#   - FFmpeg 8.0 from Sky1-Linux/ffmpeg-sky1 (sky1 branch): V4L2 M2M
+#     auto-hwaccel for the Sky1 VPU, its own C compiled with the same -march.
+#   - Overlaid onto the official Jellyfin image (debian:trixie base -> GCC 14,
+#     which supports armv9.2-a, and matches the runtime ABI).
+#
+# HARDWARE NOTE: hardware transcoding only works on a real Sky1 host (Radxa
+# Orion O6) booted with the Sky1 kernel + VPU firmware, with /dev/video*,
+# /dev/dma_heap, and the video group passed into the container.
+#
+# The Armv9.2 tuning makes the binary NON-PORTABLE (SIGILL on older ARM) — by
+# design, since it targets the Sky1 cores specifically.
+###############################################################################
+
+ARG JELLYFIN_IMAGE=jellyfin/jellyfin:latest
+ARG FFMPEG_REF=sky1
+ARG FFMPEG_REPO=https://github.com/Sky1-Linux/ffmpeg-sky1.git
+ARG MARCH=armv9.2-a
+ARG MTUNE=cortex-a720
+
+# ---------------------------------------------------------------------------
+# Stage 1: build tuned encoders + Sky1 FFmpeg
+# ---------------------------------------------------------------------------
+FROM ${JELLYFIN_IMAGE} AS builder
+ARG FFMPEG_REF
+ARG FFMPEG_REPO
+ARG MARCH
+ARG MTUNE
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PREFIX=/opt/sky1-deps
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git ca-certificates build-essential pkg-config nasm yasm cmake ninja-build \
+      linux-libc-dev libv4l-dev libdrm-dev \
+      libopus-dev libmp3lame-dev libvorbis-dev libvpx-dev \
+      libass-dev libfreetype-dev libfontconfig1-dev \
+      libfribidi-dev libharfbuzz-dev libwebp-dev \
+      libgnutls28-dev libzimg-dev libbluray-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Report the compiler version — armv9.2-a needs GCC >= 13 / Clang >= 16.
+RUN gcc --version | head -1
+
+# Build x264 / x265(multilib) / libaom, tuned for Armv9.2-A, into $PREFIX.
+COPY build-encoders.sh /tmp/build-encoders.sh
+RUN chmod +x /tmp/build-encoders.sh \
+    && PREFIX="${PREFIX}" MARCH="${MARCH}" MTUNE="${MTUNE}" /tmp/build-encoders.sh
+
+# Build the Sky1-patched FFmpeg, linking the tuned encoders statically and
+# compiling FFmpeg's own C with the same -march/-mtune.
+WORKDIR /src
+RUN git clone --depth 1 --branch "${FFMPEG_REF}" "${FFMPEG_REPO}" ffmpeg-sky1
+WORKDIR /src/ffmpeg-sky1
+ENV PKG_CONFIG_PATH=/opt/sky1-deps/lib/pkgconfig
+# Stamp a numeric FFmpeg version (the sky1 branch is a tagless shallow clone, so
+# FFmpeg would otherwise report a git hash that Jellyfin can't parse -> "version
+# unknown" -> fatal "Failed to find valid ffmpeg" on startup). The branch is
+# FFmpeg 8.0 (libavcodec 62), so 8.0 is accurate; --extra-version appends -sky1.
+RUN ARCH_FLAGS="-march=${MARCH} -mtune=${MTUNE} -O3" \
+ && echo "8.0" > VERSION \
+ && ./configure \
+      --prefix=/opt/ffmpeg-sky1 \
+      --extra-version=sky1 \
+      --arch=aarch64 \
+      --extra-cflags="${ARCH_FLAGS} -I${PREFIX}/include" \
+      --extra-ldflags="-L${PREFIX}/lib" \
+      --extra-libs="-lstdc++ -lpthread -lm -ldl" \
+      --disable-doc \
+      --disable-ffplay \
+      --disable-debug \
+      --enable-gpl \
+      --enable-version3 \
+      --enable-v4l2-m2m \
+      --enable-libdrm \
+      --enable-libx264 \
+      --enable-libx265 \
+      --enable-libaom \
+      --enable-libvpx \
+      --enable-libopus \
+      --enable-libmp3lame \
+      --enable-libvorbis \
+      --enable-libass \
+      --enable-libfreetype \
+      --enable-libfontconfig \
+      --enable-libfribidi \
+      --enable-libharfbuzz \
+      --enable-libwebp \
+      --enable-libzimg \
+      --enable-libbluray \
+      --enable-gnutls \
+    && make -j"$(nproc)" \
+    && make install \
+    && /opt/ffmpeg-sky1/bin/ffmpeg -hide_banner -buildconf
+
+# ---------------------------------------------------------------------------
+# Stage 2: final Jellyfin image with the tuned Sky1 ffmpeg overlaid
+# ---------------------------------------------------------------------------
+FROM ${JELLYFIN_IMAGE} AS final
+ENV DEBIAN_FRONTEND=noninteractive
+
+# x264/x265/aom are statically linked into ffmpeg, so we only need the runtime
+# .so's for the dynamically-linked features (libass, freetype, fontconfig,
+# fribidi, harfbuzz, webp, zimg, bluray, gnutls, drm, vpx, v4l).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libass9 libfreetype6 libfontconfig1 libfribidi0 libharfbuzz0b \
+      libwebp7 libwebpmux3 libzimg2 libbluray2 libgnutls30 libdrm2 \
+      libvpx9 libopus0 libmp3lame0 libvorbis0a libvorbisenc2 \
+      libv4l-0 v4l-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /opt/ffmpeg-sky1 /opt/ffmpeg-sky1
+# Make our ffmpeg the one Jellyfin invokes (zero dashboard config needed).
+RUN set -eux; \
+    mkdir -p /usr/lib/jellyfin-ffmpeg; \
+    ln -sf /opt/ffmpeg-sky1/bin/ffmpeg  /usr/lib/jellyfin-ffmpeg/ffmpeg; \
+    ln -sf /opt/ffmpeg-sky1/bin/ffprobe /usr/lib/jellyfin-ffmpeg/ffprobe; \
+    ln -sf /opt/ffmpeg-sky1/bin/ffmpeg  /usr/local/bin/ffmpeg; \
+    ln -sf /opt/ffmpeg-sky1/bin/ffprobe /usr/local/bin/ffprobe; \
+    /opt/ffmpeg-sky1/bin/ffmpeg -hide_banner -version; \
+    echo "== v4l2 ==" && /opt/ffmpeg-sky1/bin/ffmpeg -hide_banner -decoders | grep -i v4l2 || true
+
+# Jellyfin's entrypoint/ports/volumes are inherited from the base image.

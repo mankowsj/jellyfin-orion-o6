@@ -1,0 +1,35 @@
+# Deploy on the Sky1 host (Radxa Orion O6). This file runs the image you
+# cross-built on Windows and pushed/loaded onto the board.
+#
+# Find your VPU nodes first:   ls -l /dev/video*   and   ls -l /dev/dma_heap
+# The Linlon/Sky1 VPU typically exposes several /dev/videoN nodes; pass the
+# ones that are the codec (m2m) devices. When unsure, pass all of them.
+
+services:
+  jellyfin:
+    image: jellyfin-orion-o6:latest
+    container_name: jellyfin-orion-o6
+    restart: unless-stopped
+    ports:
+      - "8096:8096"          # web UI / API
+      # - "8920:8920"        # optional HTTPS
+      # - "7359:7359/udp"    # client auto-discovery
+      # - "1900:1900/udp"    # DLNA
+
+    # --- Sky1 VPU passthrough -------------------------------------------
+    group_add:
+      - "video"              # or the numeric GID of the 'video' group on the host
+    devices:
+      - "/dev/video0:/dev/video0"
+      - "/dev/video1:/dev/video1"
+      # add every codec m2m node the host exposes, e.g. /dev/video2 ...
+    # DMABUF allocator the V4L2 M2M path uses for zero-copy buffers.
+    volumes:
+      - "/dev/dma_heap:/dev/dma_heap"
+      - "./config:/config"
+      - "./cache:/cache"
+      - "/srv/media:/media:ro"   # <-- point at your library
+
+    # If device passthrough is fiddly while you get it working, you can
+    # temporarily uncomment this instead of the devices/group_add block:
+    # privileged: true

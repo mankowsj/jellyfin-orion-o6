@@ -1,0 +1,283 @@
+diff --git a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+index 8aeec3f..5c5a9b5 100644
+--- a/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
++++ b/MediaBrowser.Controller/MediaEncoding/EncodingHelper.cs
+@@ -225,6 +225,15 @@ namespace MediaBrowser.Controller.MediaEncoding
+                     && codecMap.TryGetValue(hwType, out var preferredEncoder)
+                     && _mediaEncoder.SupportsEncoder(preferredEncoder))
+                 {
++                    // V4L2M2M HEVC hardware encoding is opt-in (the VPU encoder wrapper has
++                    // basic rate control); fall back to software x265 when the toggle is off.
++                    if (hwType == HardwareAccelerationType.v4l2m2m
++                        && string.Equals(hwEncoder, "hevc", StringComparison.OrdinalIgnoreCase)
++                        && !encodingOptions.EnableV4l2m2mHevcEncoder)
++                    {
++                        return defaultEncoder;
++                    }
++
+                     return preferredEncoder;
+                 }
+             }
+@@ -2229,7 +2238,7 @@ namespace MediaBrowser.Controller.MediaEncoding
+             {
+                 // Currently there's no profile option in av1_nvenc encoder
+                 if (!(string.Equals(videoEncoder, "av1_nvenc", StringComparison.OrdinalIgnoreCase)
+-                      || string.Equals(videoEncoder, "h264_v4l2m2m", StringComparison.OrdinalIgnoreCase)))
++                      || (videoEncoder is not null && videoEncoder.Contains("_v4l2m2m", StringComparison.OrdinalIgnoreCase))))
+                 {
+                     param += " -profile:v:0 " + profile;
+                 }
+@@ -3384,7 +3393,7 @@ namespace MediaBrowser.Controller.MediaEncoding
+             int? requestedMaxWidth,
+             int? requestedMaxHeight)
+         {
+-            var isV4l2 = string.Equals(videoEncoder, "h264_v4l2m2m", StringComparison.OrdinalIgnoreCase);
++            var isV4l2 = videoEncoder is not null && videoEncoder.Contains("_v4l2m2m", StringComparison.OrdinalIgnoreCase);
+             var isMjpeg = videoEncoder is not null && videoEncoder.Contains("mjpeg", StringComparison.OrdinalIgnoreCase);
+             var scaleVal = isV4l2 ? 64 : 2;
+             var targetAr = isMjpeg ? "(a*sar)" : "a"; // manually calculate AR when using mjpeg encoder
+@@ -3773,9 +3782,13 @@ namespace MediaBrowser.Controller.MediaEncoding
+             var threeDFormat = state.MediaSource.Video3DFormat;
+ 
+             var vidDecoder = GetHardwareVideoDecoder(state, options) ?? string.Empty;
+-            var isSwDecoder = string.IsNullOrEmpty(vidDecoder);
++            // The V4L2 M2M decoder outputs system-memory frames, so treat it as a software
++            // decoder here: the software filter chain (yuv420p) applies even though a hardware
++            // codec did the decoding.
++            var isSwDecoder = string.IsNullOrEmpty(vidDecoder)
++                || vidDecoder.Contains("_v4l2m2m", StringComparison.OrdinalIgnoreCase);
+             var isVaapiEncoder = vidEncoder.Contains("vaapi", StringComparison.OrdinalIgnoreCase);
+-            var isV4l2Encoder = vidEncoder.Contains("h264_v4l2m2m", StringComparison.OrdinalIgnoreCase);
++            var isV4l2Encoder = vidEncoder.Contains("_v4l2m2m", StringComparison.OrdinalIgnoreCase);
+ 
+             var doDeintH264 = state.DeInterlace("h264", true) || state.DeInterlace("avc", true);
+             var doDeintHevc = state.DeInterlace("h265", true) || state.DeInterlace("hevc", true);
+@@ -6424,6 +6437,7 @@ namespace MediaBrowser.Controller.MediaEncoding
+                     HardwareAccelerationType.nvenc => GetNvdecVidDecoder(state, options, videoStream, bitDepth),
+                     HardwareAccelerationType.videotoolbox => GetVideotoolboxVidDecoder(state, options, videoStream, bitDepth),
+                     HardwareAccelerationType.rkmpp => GetRkmppVidDecoder(state, options, videoStream, bitDepth),
++                    HardwareAccelerationType.v4l2m2m => GetV4l2VidDecoder(state, options, videoStream, bitDepth),
+                     _ => string.Empty
+                 };
+ 
+@@ -7007,6 +7021,118 @@ namespace MediaBrowser.Controller.MediaEncoding
+             return null;
+         }
+ 
++        /// <summary>
++        /// Gets the V4L2 M2M (VPU) video decoder for the stream, if that codec's hardware
++        /// decoding checkbox is ticked and the decoder is available. Emits an explicit
++        /// " -c:v &lt;codec&gt;_v4l2m2m" so the decode is visible/controllable (otherwise the
++        /// ffmpeg-sky1 auto-hwaccel would decode on the VPU implicitly). The V4L2 M2M decoder
++        /// outputs system-memory frames, so the software filter chain applies.
++        /// </summary>
++        public string GetV4l2VidDecoder(EncodingJobInfo state, EncodingOptions options, MediaStream videoStream, int bitDepth)
++        {
++            if (!OperatingSystem.IsLinux()
++                || state?.MediaSource is null
++                || options.HardwareAccelerationType != HardwareAccelerationType.v4l2m2m
++                || string.IsNullOrEmpty(videoStream?.Codec))
++            {
++                return null;
++            }
++
++            // Map the stream codec to (checkbox codec, V4L2 M2M decoder prefix).
++            string uiCodec, decoderPrefix;
++            switch (videoStream.Codec.ToLowerInvariant())
++            {
++                case "avc":
++                case "h264": uiCodec = "h264"; decoderPrefix = "h264"; break;
++                case "h265":
++                case "hevc": uiCodec = "hevc"; decoderPrefix = "hevc"; break;
++                case "mpeg1video": uiCodec = "mpeg1video"; decoderPrefix = "mpeg1"; break;
++                case "mpeg2video": uiCodec = "mpeg2video"; decoderPrefix = "mpeg2"; break;
++                case "mpeg4": uiCodec = "mpeg4"; decoderPrefix = "mpeg4"; break;
++                case "vc1": uiCodec = "vc1"; decoderPrefix = "vc1"; break;
++                case "vp8": uiCodec = "vp8"; decoderPrefix = "vp8"; break;
++                case "vp9": uiCodec = "vp9"; decoderPrefix = "vp9"; break;
++                case "av1": uiCodec = "av1"; decoderPrefix = "av1"; break;
++                default: return null;
++            }
++
++            // Gates on SupportsDecoder(<prefix>_v4l2m2m) and the codec being ticked in
++            // HardwareDecodingCodecs; returns " -c:v <prefix>_v4l2m2m" or null.
++            return GetHwDecoderName(options, decoderPrefix, "v4l2m2m", uiCodec, bitDepth);
++        }
++
++        private static string GetV4l2DecoderPrefix(string streamCodec)
++        {
++            switch (streamCodec?.ToLowerInvariant())
++            {
++                case "avc":
++                case "h264": return "h264";
++                case "h265":
++                case "hevc": return "hevc";
++                case "mpeg1video": return "mpeg1";
++                case "mpeg2video": return "mpeg2";
++                case "mpeg4": return "mpeg4";
++                case "vc1": return "vc1";
++                case "vp8": return "vp8";
++                case "vp9": return "vp9";
++                case "av1": return "av1";
++                default: return null;
++            }
++        }
++
++        /// <summary>
++        /// Determines whether the output video is encoded by a hardware encoder.
++        /// </summary>
++        /// <param name="state">Encoding state.</param>
++        /// <param name="options">Encoding options.</param>
++        /// <returns>Whether a hardware video encoder is used.</returns>
++        public bool IsHardwareVideoEncoder(EncodingJobInfo state, EncodingOptions options)
++        {
++            var encoder = GetVideoEncoder(state, options);
++            if (string.IsNullOrEmpty(encoder) || IsCopyCodec(encoder))
++            {
++                return false;
++            }
++
++            return encoder.Contains("_amf", StringComparison.OrdinalIgnoreCase)
++                || encoder.Contains("_nvenc", StringComparison.OrdinalIgnoreCase)
++                || encoder.Contains("_qsv", StringComparison.OrdinalIgnoreCase)
++                || encoder.Contains("_vaapi", StringComparison.OrdinalIgnoreCase)
++                || encoder.Contains("_videotoolbox", StringComparison.OrdinalIgnoreCase)
++                || encoder.Contains("_rkmpp", StringComparison.OrdinalIgnoreCase)
++                || encoder.Contains("_v4l2m2m", StringComparison.OrdinalIgnoreCase);
++        }
++
++        /// <summary>
++        /// Determines whether the input video is decoded by a hardware decoder. For V4L2 M2M this
++        /// also accounts for the ffmpeg-sky1 auto-hwaccel, which decodes on the VPU even when the
++        /// per-codec hardware-decoding checkbox is off.
++        /// </summary>
++        /// <param name="state">Encoding state.</param>
++        /// <param name="options">Encoding options.</param>
++        /// <returns>Whether a hardware video decoder is used.</returns>
++        public bool IsHardwareVideoDecoder(EncodingJobInfo state, EncodingOptions options)
++        {
++            if (state?.VideoStream is null || IsCopyCodec(state.OutputVideoCodec))
++            {
++                return false;
++            }
++
++            if (!string.IsNullOrEmpty(GetHardwareVideoDecoder(state, options)))
++            {
++                return true;
++            }
++
++            if (options.HardwareAccelerationType == HardwareAccelerationType.v4l2m2m)
++            {
++                var decoderPrefix = GetV4l2DecoderPrefix(state.VideoStream.Codec);
++                return decoderPrefix is not null
++                    && _mediaEncoder.SupportsDecoder(decoderPrefix + "_v4l2m2m");
++            }
++
++            return false;
++        }
++
+         public string GetRkmppVidDecoder(EncodingJobInfo state, EncodingOptions options, MediaStream videoStream, int bitDepth)
+         {
+             var isLinux = OperatingSystem.IsLinux();
+diff --git a/MediaBrowser.MediaEncoding/Encoder/EncoderValidator.cs b/MediaBrowser.MediaEncoding/Encoder/EncoderValidator.cs
+index 68d6d21..ddb41a8 100644
+--- a/MediaBrowser.MediaEncoding/Encoder/EncoderValidator.cs
++++ b/MediaBrowser.MediaEncoding/Encoder/EncoderValidator.cs
+@@ -56,7 +56,16 @@ namespace MediaBrowser.MediaEncoding.Encoder
+             "mpeg4_rkmpp",
+             "vp8_rkmpp",
+             "vp9_rkmpp",
+-            "av1_rkmpp"
++            "av1_rkmpp",
++            "h264_v4l2m2m",
++            "hevc_v4l2m2m",
++            "mpeg1_v4l2m2m",
++            "mpeg2_v4l2m2m",
++            "mpeg4_v4l2m2m",
++            "vc1_v4l2m2m",
++            "vp8_v4l2m2m",
++            "vp9_v4l2m2m",
++            "av1_v4l2m2m"
+         ];
+ 
+         private static readonly string[] _requiredEncoders =
+@@ -91,6 +100,7 @@ namespace MediaBrowser.MediaEncoding.Encoder
+             "av1_vaapi",
+             "mjpeg_vaapi",
+             "h264_v4l2m2m",
++            "hevc_v4l2m2m",
+             "h264_videotoolbox",
+             "hevc_videotoolbox",
+             "mjpeg_videotoolbox",
+diff --git a/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs b/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
+index 2fd054f..277e219 100644
+--- a/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
++++ b/MediaBrowser.MediaEncoding/Transcoding/TranscodeManager.cs
+@@ -346,7 +346,12 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+         {
+             var audioCodec = state.ActualOutputAudioCodec;
+             var videoCodec = state.ActualOutputVideoCodec;
+-            var hardwareAccelerationType = _serverConfigurationManager.GetEncodingOptions().HardwareAccelerationType;
++            var encodingOptions = _serverConfigurationManager.GetEncodingOptions();
++            var hardwareAccelerationType = encodingOptions.HardwareAccelerationType;
++
++            // Report whether the video is actually being de/encoded in hardware (this reflects the
++            // real decoder/encoder selection, not just the configured acceleration type).
++            var isTranscodingVideo = state.VideoRequest is not null && !EncodingHelper.IsCopyCodec(state.OutputVideoCodec);
+ 
+             _sessionManager.ReportTranscodingInfo(deviceId, new TranscodingInfo
+             {
+@@ -362,6 +367,8 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
+                 IsAudioDirect = EncodingHelper.IsCopyCodec(state.OutputAudioCodec),
+                 IsVideoDirect = EncodingHelper.IsCopyCodec(state.OutputVideoCodec),
+                 HardwareAccelerationType = hardwareAccelerationType,
++                IsHardwareDecoding = isTranscodingVideo ? _encodingHelper.IsHardwareVideoDecoder(state, encodingOptions) : null,
++                IsHardwareEncoding = isTranscodingVideo ? _encodingHelper.IsHardwareVideoEncoder(state, encodingOptions) : null,
+                 TranscodeReasons = state.TranscodeReasons
+             });
+         }
+diff --git a/MediaBrowser.Model/Configuration/EncodingOptions.cs b/MediaBrowser.Model/Configuration/EncodingOptions.cs
+index 2720c0b..ee4e9bc 100644
+--- a/MediaBrowser.Model/Configuration/EncodingOptions.cs
++++ b/MediaBrowser.Model/Configuration/EncodingOptions.cs
+@@ -54,6 +54,7 @@ public class EncodingOptions
+         EnableIntelLowPowerH264HwEncoder = false;
+         EnableIntelLowPowerHevcHwEncoder = false;
+         EnableHardwareEncoding = true;
++        EnableV4l2m2mHevcEncoder = false;
+         AllowHevcEncoding = false;
+         AllowAv1Encoding = false;
+         EnableSubtitleExtraction = true;
+@@ -271,6 +272,11 @@ public class EncodingOptions
+     /// </summary>
+     public bool EnableHardwareEncoding { get; set; }
+ 
++    /// <summary>
++    /// Gets or sets a value indicating whether the V4L2 (V4L2M2M) HEVC hardware encoder is used.
++    /// </summary>
++    public bool EnableV4l2m2mHevcEncoder { get; set; }
++
+     /// <summary>
+     /// Gets or sets a value indicating whether HEVC encoding is enabled.
+     /// </summary>
+diff --git a/MediaBrowser.Model/Session/TranscodingInfo.cs b/MediaBrowser.Model/Session/TranscodingInfo.cs
+index 11e8384..fd97901 100644
+--- a/MediaBrowser.Model/Session/TranscodingInfo.cs
++++ b/MediaBrowser.Model/Session/TranscodingInfo.cs
+@@ -69,6 +69,16 @@ public class TranscodingInfo
+     /// </summary>
+     public HardwareAccelerationType? HardwareAccelerationType { get; set; }
+ 
++    /// <summary>
++    /// Gets or sets a value indicating whether the video is being decoded in hardware.
++    /// </summary>
++    public bool? IsHardwareDecoding { get; set; }
++
++    /// <summary>
++    /// Gets or sets a value indicating whether the video is being encoded in hardware.
++    /// </summary>
++    public bool? IsHardwareEncoding { get; set; }
++
+     /// <summary>
+     /// Gets or sets the transcode reasons.
+     /// </summary>

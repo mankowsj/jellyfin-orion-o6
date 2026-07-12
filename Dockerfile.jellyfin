@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+# Patched Jellyfin server + web with a toggleable V4L2M2M HEVC hardware encoder.
+#   Main build context = patched jellyfin server repo (v10.11.11 + edits).
+#   Named build context `websrc` = patched jellyfin-web repo (v10.11.11 + edit).
+# Both stages build natively on the build platform (no emulation); only the
+# final overlay is arm64.
+#
+# Build via ./build.sh, or manually:
+#   docker buildx build --platform linux/arm64 -f Dockerfile.jellyfin \
+#     --build-arg BASE_IMAGE=jellyfin-orion-o6-base:latest \
+#     --build-context websrc=/path/to/patched/jellyfin-web \
+#     -t jellyfin-orion-o6:latest --load /path/to/patched/jellyfin
+
+ARG BASE_IMAGE=jellyfin-orion-o6-base:latest
+
+FROM --platform=$BUILDPLATFORM node:20 AS webbuild
+ENV NODE_OPTIONS=--max-old-space-size=4096
+WORKDIR /src
+COPY --from=websrc . .
+RUN npm ci --no-audit --no-fund --unsafe-perm \
+ && npm run build:production \
+ && test -f dist/index.html \
+ && mv dist /web
+
+FROM --platform=$BUILDPLATFORM mcr.microsoft.com/dotnet/sdk:9.0 AS server
+WORKDIR /src
+COPY . .
+RUN dotnet publish Jellyfin.Server \
+      --configuration Release --arch arm64 --self-contained true \
+      -p:DebugSymbols=false -p:DebugType=none --output /server \
+ && test -x /server/jellyfin
+
+FROM ${BASE_IMAGE} AS final
+COPY --from=server /server/ /jellyfin/
+COPY --from=webbuild /web/ /jellyfin/jellyfin-web/
