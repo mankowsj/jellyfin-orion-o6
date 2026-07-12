@@ -12,7 +12,7 @@ It combines:
 
 > The VPU only works on a real Sky1 host running the Sky1 kernel + firmware
 > (`/dev/video*`, `/dev/dma_heap`). The image builds anywhere, but hardware
-> transcoding requires the O6.
+> transcoding requires the O6 or a compatible model such as Minisforum MS-R1.
 
 ---
 
