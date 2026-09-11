@@ -57,6 +57,16 @@ RUN chmod +x /tmp/build-encoders.sh \
 WORKDIR /src
 RUN git clone --depth 1 --branch "${FFMPEG_REF}" "${FFMPEG_REPO}" ffmpeg-sky1
 WORKDIR /src/ffmpeg-sky1
+
+# The sky1 branch already defines the vp9_v4l2m2m encoder (FFCodec struct +
+# allcodecs.c registration), but configure never got a vp9_v4l2m2m_encoder_deps
+# line (unlike h264/hevc/vp8/mpeg4, which all have one) -- see
+# patches/ffmpeg-sky1-vp9-encoder.patch. Applied idempotently: a no-op if
+# upstream has since added it themselves.
+COPY patches/ffmpeg-sky1-vp9-encoder.patch /tmp/ffmpeg-sky1-vp9-encoder.patch
+RUN grep -q '^vp9_v4l2m2m_encoder_deps=' configure \
+    || git apply /tmp/ffmpeg-sky1-vp9-encoder.patch
+
 ENV PKG_CONFIG_PATH=/opt/sky1-deps/lib/pkgconfig
 # Stamp a numeric FFmpeg version (the sky1 branch is a tagless shallow clone, so
 # FFmpeg would otherwise report a git hash that Jellyfin can't parse -> "version
@@ -123,6 +133,9 @@ RUN set -eux; \
     ln -sf /opt/ffmpeg-sky1/bin/ffmpeg  /usr/local/bin/ffmpeg; \
     ln -sf /opt/ffmpeg-sky1/bin/ffprobe /usr/local/bin/ffprobe; \
     /opt/ffmpeg-sky1/bin/ffmpeg -hide_banner -version; \
-    echo "== v4l2 ==" && /opt/ffmpeg-sky1/bin/ffmpeg -hide_banner -decoders | grep -i v4l2 || true
+    echo "== v4l2 decoders ==" && /opt/ffmpeg-sky1/bin/ffmpeg -hide_banner -decoders | grep -i v4l2 || true; \
+    echo "== v4l2 encoders ==" && /opt/ffmpeg-sky1/bin/ffmpeg -hide_banner -encoders | grep -i v4l2 || true; \
+    /opt/ffmpeg-sky1/bin/ffmpeg -hide_banner -encoders | grep -q vp9_v4l2m2m \
+      || { echo "FATAL: vp9_v4l2m2m encoder missing from ffmpeg-sky1 build" >&2; exit 1; }
 
 # Jellyfin's entrypoint/ports/volumes are inherited from the base image.

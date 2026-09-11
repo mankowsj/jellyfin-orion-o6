@@ -6,7 +6,7 @@ with a CPU-tuned software-encode fallback.
 
 It combines:
 
-1. **FFmpeg with the Sky1 V4L2 M2M patches** ([Sky1-Linux/ffmpeg-sky1](https://github.com/Sky1-Linux/ffmpeg-sky1)) — VPU decode/encode for H.264, HEVC, AV1 (decode), VP8/VP9, MPEG2/4, VC1.
+1. **FFmpeg with the Sky1 V4L2 M2M patches** ([Sky1-Linux/ffmpeg-sky1](https://github.com/Sky1-Linux/ffmpeg-sky1)) — VPU decode/encode for H.264, HEVC, VP8/VP9, MPEG2/4, VC1 (AV1 is decode-only), plus a local one-line `configure` fix (below) so `vp9_v4l2m2m` actually gets built.
 2. **x264, x265 (8/10/12-bit) and libaom built from source, tuned for Armv9.2-A** (`-march=armv9.2-a -mtune=cortex-a720`) with SVE2 — the software HEVC/H.264/AV1 encoders used when the VPU isn't chosen.
 3. **A patched Jellyfin 10.11.11** (server + web) that actually drives, controls, and reports the VPU. Stock Jellyfin only wires V4L2 M2M for H.264 encode; the patches extend it to the full VPU pipeline and surface hardware usage in the UI.
 
@@ -18,9 +18,10 @@ It combines:
 
 ## What was changed
 
-### FFmpeg (`Dockerfile.ffmpeg`, `build-encoders.sh`)
+### FFmpeg (`Dockerfile.ffmpeg`, `build-encoders.sh`, `patches/ffmpeg-sky1-vp9-encoder.patch`)
 
 - Builds FFmpeg 8.0 from the `Sky1-Linux/ffmpeg-sky1` `sky1` branch (V4L2 M2M VPU decode/encode + auto-hwaccel).
+- **VP9 hardware encode fix**: the `sky1` branch already defines the `vp9_v4l2m2m` encoder (`FFCodec` struct in `libavcodec/v4l2_m2m_enc.c` + registration in `allcodecs.c`) — the CIX VPU genuinely encodes VP9 in hardware (confirmed against the `sky1-drivers-dkms` VPU register tables, which set `MVX_FORMAT_VP9` for both directions). But unlike every other dual-direction V4L2M2M codec (h264/hevc/vp8/mpeg4), `configure` was never given a `vp9_v4l2m2m_encoder_deps` line, so the encoder's build dependency on `v4l2_m2m`/`vp9_v4l2_m2m` was never declared. `patches/ffmpeg-sky1-vp9-encoder.patch` adds the missing line (applied idempotently in `Dockerfile.ffmpeg` — a no-op once upstream adds it themselves), and the build now fails loudly if `vp9_v4l2m2m` doesn't show up in `ffmpeg -encoders`.
 - Rebuilds **x264, x265 (8/10/12-bit multilib) and libaom from source** with `-march=armv9.2-a -mtune=cortex-a720`, statically linked into FFmpeg, so the software encoders use SVE2/i8mm on the A720/A520 cores.
 - Stamps a numeric FFmpeg version (`8.0`). The `sky1` branch is a tagless checkout, so FFmpeg otherwise reports a git hash that Jellyfin can't parse — which makes Jellyfin reject the encoder and fail to start.
 - Overlays the result onto the official `jellyfin/jellyfin` image (Debian trixie / GCC 14) so the compiled FFmpeg's ABI matches the runtime.
@@ -51,6 +52,7 @@ Dockerfile.ffmpeg          # Stage 1: Sky1 FFmpeg + armv9.2 encoders → base im
 build-encoders.sh          #          x264/x265/libaom source build
 Dockerfile.jellyfin        # Stage 2: patched Jellyfin server+web onto the base
 patches/
+  ffmpeg-sky1-vp9-encoder.patch  # 1 file, applied to Sky1-Linux/ffmpeg-sky1 (sky1 branch)
   jellyfin-server.patch    # 5 files, applied to jellyfin v10.11.11
   jellyfin-web.patch        # 3 files, applied to jellyfin-web v10.11.11
 build.sh                   # clone + patch + build both stages
@@ -67,7 +69,11 @@ docker run --privileged --rm tonistiigi/binfmt --install arm64
 ```
 
 Stage 1 (FFmpeg) compiles under arm64 emulation (~25 min). The Jellyfin server
-(.NET) and web (webpack) cross-compile natively on the build host. Then push:
+(.NET) and web (webpack) cross-compile natively on the build host. Right after
+stage 1, `build.sh` also extracts the standalone arm64 `ffmpeg`/`ffprobe` to
+`dist/ffmpeg-sky1/bin/` — useful on its own as a drop-in for anything else that
+shells out to a V4L2M2M ffmpeg on this hardware (e.g. Immich's bundled
+`jellyfin-ffmpeg`, see the Verify section). Then push the Jellyfin image:
 
 ```bash
 docker tag jellyfin-orion-o6:latest <your-registry>/jellyfin-orion-o6:latest
@@ -101,12 +107,26 @@ decoding** and **Hardware encoding** status.
 Startup log (`docker logs`) should list the VPU codecs:
 
 ```
-Available decoders: [..., "av1_v4l2m2m", "hevc_v4l2m2m", "h264_v4l2m2m", ...]
-Available encoders: [..., "h264_v4l2m2m", "hevc_v4l2m2m", ...]
+Available decoders: [..., "av1_v4l2m2m", "vp9_v4l2m2m", "hevc_v4l2m2m", "h264_v4l2m2m", ...]
+Available encoders: [..., "h264_v4l2m2m", "hevc_v4l2m2m", "vp9_v4l2m2m", ...]
 ```
+
+Or directly: `ffmpeg -hide_banner -encoders | grep v4l2m2m` should list `vp9_v4l2m2m` — the
+Docker build fails outright if it doesn't (see the FFmpeg section above).
 
 In a transcode's FFmpeg log, the `Stream mapping` shows e.g.
 `av1 (av1_v4l2m2m) -> hevc (hevc_v4l2m2m)` (both on the VPU).
+
+> **Note:** stock Jellyfin has no code path that transcodes *to* VP9 for any hardware
+> vendor (VP9 is only ever a source/decode codec there), so `vp9_v4l2m2m` won't show
+> up as a pickable output in the Jellyfin dashboard even though the binary now has it.
+> It's there for other software that drives this same ffmpeg binary directly and does
+> target VP9 output — e.g. Immich's transcoding settings, which bundle
+> [jellyfin/jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) by default and
+> let you pick VP9 as the target codec. That upstream build doesn't register a
+> `vp9_v4l2m2m` encoder at all (only h263/h264/hevc/mpeg4/vp8); this image's ffmpeg
+> (`/opt/ffmpeg-sky1`, symlinked to `/usr/lib/jellyfin-ffmpeg/ffmpeg`) can be used as a
+> drop-in replacement to get hardware VP9 encoding there instead.
 
 ## Known limitations
 
